@@ -1,0 +1,17 @@
+[package]
+name = "digibib"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+binrw = "0.11.1"
+color-eyre = "0.6.2"
+encoding_rs = "0.8.32"
+encoding_rs_io = "0.1.7"
+eyre = "0.6.8"
+tracing = { version = "0.1.37", features = ["async-await"] }
+tracing-error = "0.2.0"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
