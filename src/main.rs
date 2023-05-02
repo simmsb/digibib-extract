@@ -1,8 +1,8 @@
-use std::{fs::File, io::Cursor};
+use std::{fs::File, io::Cursor, path::PathBuf};
 
+use clap::Parser;
 use binrw::BinReaderExt;
 use color_eyre::Result;
-
 use text::PageTable;
 use tikv_jemallocator::Jemalloc;
 use toc::TocItem;
@@ -18,6 +18,12 @@ mod text;
 mod token;
 mod typst;
 mod decoding;
+
+#[derive(Parser)]
+struct Opts {
+    #[clap(short, long)]
+    data_dir: PathBuf,
+}
 
 fn install_tracing() -> Result<()> {
     use tracing_subscriber::fmt::format::FmtSpan;
@@ -41,12 +47,14 @@ fn install_tracing() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let opts = Opts::parse();
+
     color_eyre::install()?;
     install_tracing()?;
 
-    let tree_dki = File::open("tree.dki")?;
-    let tree_dka = File::open("tree.dka")?;
-    let text_dki = std::fs::read("text.dki")?;
+    let tree_dki = File::open(opts.data_dir.join("tree.dki"))?;
+    let tree_dka = File::open(opts.data_dir.join("tree.dka"))?;
+    let text_dki = std::fs::read(opts.data_dir.join("text.dki"))?;
     let mut text_dki = Cursor::new(text_dki.as_slice());
 
     let toc = toc::Toc::load(tree_dki, tree_dka)?;

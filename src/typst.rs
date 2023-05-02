@@ -1,31 +1,40 @@
-use std::fmt::Write;
+use std::{fmt::Write, collections::{HashMap, HashSet}};
+
+use once_cell::sync::{OnceCell, Lazy};
+use regex::Regex;
 
 use crate::{decoding, text::Page, token::Token};
 
-pub struct State {
-    italic: bool,
-    bold: bool,
-    font_size: u8,
+pub struct State<W> {
+    writer: W,
+    superscript: bool,
     font_idx: u8,
     word_incomplete: bool,
     had_carriage_return: bool,
     add_hyphen_at_eol: bool,
     add_hyphen_at_eol_separating_ck: bool,
     add_invisible_hyphen: bool,
+    file_name: Option<String>,
+    concordance: Option<u16>,
+    node_number: Option<u16>,
+    current_functions: HashSet<&'static str>,
 }
 
-impl State {
-    fn new() -> Self {
+impl<W: Write> State<W> {
+    fn new(writer: W) -> Self {
         Self {
-            italic: false,
-            bold: false,
-            font_size: 10,
+            writer,
+            superscript: false,
             font_idx: 0,
             word_incomplete: false,
             had_carriage_return: false,
             add_hyphen_at_eol: false,
             add_hyphen_at_eol_separating_ck: false,
             add_invisible_hyphen: false,
+            file_name: None,
+            concordance: None,
+            node_number: None,
+            current_functions: HashSet::new(),
         }
     }
 
@@ -38,16 +47,40 @@ impl State {
     fn hyphen(&self) -> bool {
         self.add_hyphen_at_eol || self.add_hyphen_at_eol_separating_ck || self.add_invisible_hyphen
     }
+
+    fn push_state(&mut self, key: &'static str, val: impl AsRef<str>) -> eyre::Result<()> {
+        if !self.current_functions.insert(key) {
+            write!(self, "]")?;
+        }
+
+        write!(self, "#{}[", val.as_ref())?;
+
+        Ok(())
+    }
+
+    fn pop_state(&mut self, key: &str) -> eyre::Result<()> {
+        if self.current_functions.remove(key) {
+            write!(self, "]")?;
+        }
+
+        Ok(())
+    }
 }
 
-pub fn write_page(page: &Page, lexed: &[Token], mut output: impl Write) -> eyre::Result<()> {
-    let mut state = State::new();
+impl<W: Write> Write for State<W> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.writer.write_str(s)
+    }
+}
+
+pub fn write_page(page: &Page, lexed: &[Token], output: impl Write) -> eyre::Result<()> {
+    let mut state = State::new(output);
 
     for t in lexed {
         match t {
             Token::Blanks(number) => {
                 for _ in 0..*number {
-                    write!(output, " ")?;
+                    write!(state, " ")?;
                 }
             }
             Token::Word { space_at_end, data } => {
@@ -57,83 +90,82 @@ pub fn write_page(page: &Page, lexed: &[Token], mut output: impl Write) -> eyre:
                     state.word_incomplete = false;
                 } else {
                     if s.len() > 0 {
-                        let mut closers = 0;
-                        if state.font_size != 10 {
-                            write!(output, "#text(size: {}em)[", state.font_size as f32 / 10.0)?;
-                            closers += 1;
-                        }
-                        if state.italic {
-                            write!(output, "#emph[")?;
-                            closers += 1;
-                        }
-                        if state.bold {
-                            write!(output, "#strong[")?;
-                            closers += 1;
-                        }
 
-                        write!(output, "{}", s)?;
+                        static ESCAPER: Lazy<Regex> = Lazy::new(|| Regex::new(r"[#()\[\]]").unwrap());
 
-                        for _ in 0..closers {
-                            write!(output, "]")?;
-                        }
+                        write!(state, "{}", ESCAPER.replace_all(&s, "\\$0"))?;
                     }
                 }
 
                 state.reset_hyphens();
                 if *space_at_end || s.chars().next_back().map_or(false, |c| !c.is_alphanumeric()) {
-                    write!(output, " ")?;
+                    write!(state, " ")?;
                 }
 
             }
             Token::HardCarriageReturn => {
                 state.had_carriage_return = true;
-                writeln!(output, "\\")?;
+                writeln!(state, "\\")?;
             }
             Token::EndOfPage => { break; }
-            Token::ItalicsOn => { state.italic = true; }
-            Token::ItalicsOff => { state.italic = false; }
-            Token::BoldOn => { state.bold = true; }
-            Token::BoldOff => { state.bold = false; }
+            Token::ItalicsOn => { state.push_state("emph", "emph")?; }
+            Token::ItalicsOff => { state.pop_state("emph")?; }
+            Token::BoldOn => { state.push_state("strong", "strong")?; }
+            Token::BoldOff => { state.pop_state("strong")?; }
             Token::FontPreset(n) => {
                 match n {
                     0 => {
-                        state.font_size = 10;
-                        state.bold = false;
-                        state.italic = false;
+                        state.push_state("font", format!("text(size: {}em)", 1.0))?;
+                        state.pop_state("strong")?;
+                        state.pop_state("italic")?;
                     }
                     1 => {
-                        state.font_size = 13;
+                        state.push_state("font", format!("text(size: {}em)", 1.33))?;
                     }
                     2 => {
-                        state.font_size = 12;
+                        state.push_state("font", format!("text(size: {}em)", 1.22))?;
                     }
                     3 => {
-                        state.font_size = 11;
+                        state.push_state("font", format!("text(size: {}em)", 1.11))?;
                     }
                     4 => {
-                        state.font_size = 10;
-                        state.bold = true;
+                        state.push_state("font", format!("text(size: {}em)", 1.0))?;
+                        state.push_state("strong", "strong")?;
                     }
                     5 => {
-                        state.font_size = 10;
+                        state.push_state("font", format!("text(size: {}em)", 1.0))?;
                     }
                     6 => {
-                        state.font_size = 10;
-                        state.italic = true;
+                        state.push_state("font", format!("text(size: {}em)", 1.0))?;
+                        state.push_state("emph", "emph")?;
                     }
                     _ => {}
                 }
             }
-            Token::Ly => {}
+            Token::Ly => {
+                // ???
+            }
             Token::Image { width, name } => {}
             Token::ImageLink(_) => {}
             Token::EndLink => {}
-            Token::Font(_) => {}
-            Token::FileName(_) => {}
-            Token::Concordance(_) => {}
-            Token::NodeNumber(_) => {}
-            Token::SuperScriptOn => {}
-            Token::SuperScriptOff => {}
+            Token::Font(n) => {
+                state.font_idx = *n;
+            }
+            Token::FileName(s) => {
+                state.file_name = Some(s.data.to_owned());
+            }
+            Token::Concordance(n) => {
+                state.concordance = Some(*n);
+            }
+            Token::NodeNumber(n) => {
+                state.node_number = Some(*n);
+            }
+            Token::SuperScriptOn => {
+                state.superscript = true;
+            }
+            Token::SuperScriptOff => {
+                state.superscript = false;
+            }
             Token::Sigil(_) => {}
             Token::Header => {}
             Token::HypenAtEol => {}

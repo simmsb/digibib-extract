@@ -7,7 +7,7 @@ pub struct Name {
     len: u8,
 
     #[br(count = len,  map = |buf: Vec<u8>| encoding_rs::WINDOWS_1252.decode(&buf).0.to_string() )]
-    data: String,
+    pub data: String,
 }
 
 impl Debug for Name {
