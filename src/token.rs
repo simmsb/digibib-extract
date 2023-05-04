@@ -6,7 +6,7 @@ pub struct Name {
     #[br(temp)]
     len: u8,
 
-    #[br(count = len,  map = |buf: Vec<u8>| encoding_rs::WINDOWS_1252.decode(&buf).0.to_string() )]
+    #[br(count = len, map = |buf: Vec<u8>| encoding_rs::WINDOWS_1252.decode(&buf).0.to_string() )]
     pub data: String,
 }
 
@@ -91,12 +91,12 @@ pub enum Token {
     TD,
     #[br(magic = 31u8)]
     Null,
-    #[br(magic = 32u8)]
+    #[br(magic = 128u8)]
     PageLink { page_number: u32, name: Name },
     #[br(magic = 129u8)]
-    IDStart,
+    IDStart(u8),
     #[br(magic = 130u8)]
-    IDEnd,
+    IDEnd(u8),
     #[br(magic = 131u8)]
     SubscriptOn,
     #[br(magic = 132u8)]
@@ -176,7 +176,16 @@ pub enum Token {
     #[br(magic = 169u8)]
     NextBlankFixed,
     #[br(magic = 170u8)]
-    WordRest(Name),
+    WordRest {
+        #[br(temp)]
+        len: u8,
+
+        #[br(calc = len & 0x80 != 0)]
+        space_at_end: bool,
+
+        #[br(count = len, map = |buf: Vec<u8>| encoding_rs::WINDOWS_1252.decode(&buf).0.to_string() )]
+        data: String,
+    },
     #[br(magic = 171u8)]
     WordIncomplete(Name),
     #[br(magic = 172u8)]

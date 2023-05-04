@@ -60,6 +60,37 @@ fn main() -> Result<()> {
     let toc = toc::Toc::load(tree_dki, tree_dka)?;
     let page_table = text::PageTable::load(&mut text_dki)?;
 
+    println!(r###"
+#let project(title: "", authors: (), body) = {{
+  // Set the document's basic properties.
+  set document(author: authors, title: title)
+  set page(numbering: "1", number-align: center)
+  set text(font: "Linux Libertine", lang: "en")
+
+  // Title row.
+  align(center)[
+    #block(text(weight: 700, 1.75em, title))
+  ]
+
+  // Author information.
+  pad(
+    top: 0.5em,
+    bottom: 0.5em,
+    x: 2em,
+    grid(
+      columns: (1fr,) * calc.min(3, authors.len()),
+      gutter: 1em,
+      ..authors.map(author => align(center, strong(author))),
+    ),
+  )
+
+  // Main body.
+  set par(justify: true)
+
+  body
+}}
+"###);
+
     for page in &toc.entries {
         do_page(&mut text_dki, &page_table, page)?;
     }
@@ -70,13 +101,13 @@ fn main() -> Result<()> {
 fn do_page(mut f: &mut Cursor<&[u8]>, page_table: &PageTable, entry: &TocItem) -> Result<()> {
     let pages = text::Pages::load(&mut f, page_table, entry.page_number, entry.page_count)?;
 
-    for page in pages.pages {
+    for (i, page) in pages.pages.iter().enumerate() {
         let lexed = page.lex();
         let mut out = String::new();
 
-        typst::write_page(&page, &lexed, &mut out)?;
+        typst::write_page(entry, entry.page_number + i, &lexed, &mut out)?;
 
-        println!("page {}: {}", page.number, out);
+        println!("{}", out);
     }
 
     for child in &entry.children {
