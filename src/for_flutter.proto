@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package text_stuffs;
+
+message ChunkStyle {
+    bool emphasis = 1;
+    bool strong = 2;
+    bool superscript = 3;
+    bool subscript = 4;
+    bool strikethrough = 5;
+    bool underline = 6;
+    bool wide_spacing = 7;
+    bool colour_gray = 8;
+    float size = 9;
+}
+
+message SegmentStyle {
+    float left_padding = 1;
+    Alignment alignment = 2;
+}
+
+enum Alignment {
+    Justified = 0;
+    Center = 1;
+    Right = 2;
+    Unjustified = 3;
+}
+
+message Chunk {
+    ChunkStyle style = 1;
+    string text = 2;
+}
+
+message Link {
+    string url = 1;
+    string text = 2;
+}
+
+message PageRef {
+    uint32 ref = 1;
+}
+
+message SearchWord {
+    string word = 1;
+}
+
+message Piece {
+    oneof body {
+        Chunk chunk = 1;
+        Link link = 2;
+        PageRef page_ref = 3;
+        SearchWord search_word = 4;
+    }
+}
+
+message Segment {
+    SegmentStyle style = 1;
+    repeated Piece pieces = 2;
+}
+
+message Segments {
+    repeated Segment segments = 1;
+}

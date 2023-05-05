@@ -1,8 +1,11 @@
 use std::{fs::File, io::Cursor, path::PathBuf};
 
-use clap::Parser;
 use binrw::BinReaderExt;
-use color_eyre::Result;
+use clap::Parser;
+use color_eyre::{Help, Result, SectionExt};
+use for_flutter_encoder::Segment;
+use ormlite::{sqlite::{SqliteConnectOptions, SqliteConnection}, ConnectOptions, Connection, Executor, Model};
+use prost::Message;
 use text::PageTable;
 use tikv_jemallocator::Jemalloc;
 use toc::TocItem;
@@ -11,18 +14,22 @@ use tracing::*;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-use crate::text::Page;
-
-mod toc;
+mod decoding;
+mod encoder;
+mod for_flutter_encoder;
 mod text;
+mod toc;
 mod token;
 mod typst;
-mod decoding;
+mod for_flutter_proto;
 
 #[derive(Parser)]
 struct Opts {
     #[clap(short, long)]
     data_dir: PathBuf,
+
+    #[clap(short, long)]
+    out_file: PathBuf,
 }
 
 fn install_tracing() -> Result<()> {
@@ -46,7 +53,15 @@ fn install_tracing() -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[derive(ormlite::Model, Debug)]
+pub struct Page {
+    id: u32,
+    content: Vec<u8>,
+    plain: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let opts = Opts::parse();
 
     color_eyre::install()?;
@@ -60,58 +75,65 @@ fn main() -> Result<()> {
     let toc = toc::Toc::load(tree_dki, tree_dka)?;
     let page_table = text::PageTable::load(&mut text_dki)?;
 
-    println!(r###"
-#let project(title: "", authors: (), body) = {{
-  // Set the document's basic properties.
-  set document(author: authors, title: title)
-  set page(numbering: "1", number-align: center)
-  set text(font: "Linux Libertine", lang: "en")
+    let mut conn =
+        SqliteConnectOptions::new()
+            .filename(&opts.out_file)
+            .journal_mode(ormlite::sqlite::SqliteJournalMode::Off)
+            .synchronous(ormlite::sqlite::SqliteSynchronous::Off)
+            .row_buffer_size(100000)
+            .locking_mode(ormlite::sqlite::SqliteLockingMode::Exclusive)
+            .create_if_missing(true)
+            .connect().await?;
 
-  // Title row.
-  align(center)[
-    #block(text(weight: 700, 1.75em, title))
-  ]
 
-  // Author information.
-  pad(
-    top: 0.5em,
-    bottom: 0.5em,
-    x: 2em,
-    grid(
-      columns: (1fr,) * calc.min(3, authors.len()),
-      gutter: 1em,
-      ..authors.map(author => align(center, strong(author))),
-    ),
-  )
+    ormlite::query(r#"
+PRAGMA temp_store = MEMORY;
+    
+CREATE TABLE page (
+  id INTEGER not null primary key,
+  content BLOB not null,
+  plain TEXT not null
+);
 
-  // Main body.
-  set par(justify: true)
+CREATE VIRTUAL TABLE page_fts USING fts5(
+    plain,
+    content='page',
+    content_rowid='id'
+);
 
-  body
-}}
-"###);
+CREATE TRIGGER page_ai AFTER INSERT ON page
+    BEGIN
+        INSERT INTO page_fts (rowid, plain)
+        VALUES (new.id, new.plain);
+    END;
+   "#).execute(&mut conn).await?;
 
     for page in &toc.entries {
-        do_page(&mut text_dki, &page_table, page)?;
+        do_page(&mut text_dki, &page_table, page, &mut conn).await?;
     }
 
     Ok(())
 }
 
-fn do_page(mut f: &mut Cursor<&[u8]>, page_table: &PageTable, entry: &TocItem) -> Result<()> {
+#[async_recursion::async_recursion]
+async fn do_page(mut f: &mut Cursor<&[u8]>, page_table: &PageTable, entry: &TocItem, conn: &mut SqliteConnection) -> Result<()> {
     let pages = text::Pages::load(&mut f, page_table, entry.page_number, entry.page_count)?;
 
     for (i, page) in pages.pages.iter().enumerate() {
         let lexed = page.lex();
-        let mut out = String::new();
+        let mut e = for_flutter_encoder::ForFlutter::new();
 
-        typst::write_page(entry, entry.page_number + i, &lexed, &mut out)?;
+        encoder::encode_page(entry, entry.page_number + i, &lexed, &mut e)?;
 
-        println!("{}", out);
+        Page {
+            id: (entry.page_number + i) as u32,
+            plain: e.plain.to_owned(),
+            content: e.to_proto().encode_to_vec(),
+        }.insert(&mut *conn).await?;
     }
 
     for child in &entry.children {
-        do_page(&mut f, page_table, child)?;
+        do_page(&mut f, page_table, child, conn).await?;
     }
 
     Ok(())

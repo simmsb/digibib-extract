@@ -1,16 +1,38 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Write,
-    sync::Arc,
-};
+use std::num::{NonZeroU8, NonZeroU16};
 
-use once_cell::sync::{Lazy, OnceCell};
+use std::fmt::Write;
+
+use once_cell::sync::Lazy;
 use regex::Regex;
 
-use crate::{decoding, text::Page, toc::TocItem, token::Token};
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Style {
+    pub left_padding: Option<NonZeroU16>,
+    pub emphasis: bool,
+    pub strong: bool,
+    pub superscript: bool,
+    pub subscript: bool,
+    pub strikethrough: bool,
+    pub underline: bool,
+    pub wide_spacing: bool,
+    pub size: Option<NonZeroU8>,
+    pub color_gray: bool,
+    pub no_justification: bool,
+    pub alignment: Option<&'static str>,
+}
 
-pub struct State<W> {
-    writer: W,
+pub trait Encoder {
+    fn chunk(&mut self, s: &str, style: &Style);
+    fn link(&mut self, url: &str, content: &str);
+    fn pageref(&mut self, page: u32);
+    fn searchword(&mut self, s: &str);
+}
+
+use crate::{decoding, toc::TocItem, token::Token};
+
+struct State<'a, E> {
+    encoder: &'a mut E,
+    queued_link: Option<(String, String)>,
     font_idx: u8,
     word_incomplete: bool,
     had_carriage_return: bool,
@@ -21,13 +43,14 @@ pub struct State<W> {
     concordance: Option<u16>,
     node_number: Option<u16>,
     sigil: Option<String>,
-    current_functions: Vec<(&'static str, String)>,
+    current_style: Style,
 }
 
-impl<W: Write> State<W> {
-    fn new(writer: W) -> Self {
+impl<'a, E: Encoder> State<'a, E> {
+    fn new(encoder: &'a mut E) -> Self {
         Self {
-            writer,
+            encoder,
+            queued_link: None,
             font_idx: 0,
             word_incomplete: false,
             had_carriage_return: false,
@@ -38,7 +61,7 @@ impl<W: Write> State<W> {
             concordance: None,
             node_number: None,
             sigil: None,
-            current_functions: Vec::new(),
+            current_style: Default::default(),
         }
     }
 
@@ -51,110 +74,28 @@ impl<W: Write> State<W> {
     fn hyphen(&self) -> bool {
         self.add_hyphen_at_eol || self.add_hyphen_at_eol_separating_ck || self.add_invisible_hyphen
     }
-
-    fn push_state(&mut self, key: &'static str, val: impl AsRef<str>) -> eyre::Result<()> {
-        self.pop_state(key)?;
-        self.current_functions.push((key, val.as_ref().to_owned()));
-
-        write!(self, "#{}[", val.as_ref())?;
-
-        Ok(())
-    }
-
-    fn pop_all_states(&mut self) -> eyre::Result<()> {
-        for _ in 0..self.current_functions.len() {
-            write!(self, "]")?;
-        }
-
-        self.current_functions.clear();
-
-        Ok(())
-    }
-
-    fn pop_state(&mut self, key: &str) -> eyre::Result<()> {
-        let idx = self
-            .current_functions
-            .iter()
-            .enumerate()
-            .find(|(_, (k, _))| *k == key);
-
-        if let Some((idx, (_, _))) = idx {
-            let after_this = self.current_functions.len() - idx - 1;
-
-            // if there are states pushed after the state we're about to remove,
-            // we need to temporarily close those before we can close this state
-
-            write!(self, "]")?;
-
-            for _ in 0..after_this {
-                write!(self, "]")?;
-            }
-
-            for (_, v) in &self.current_functions[(idx + 1)..] {
-                write!(self.writer, "#{}[", v)?;
-            }
-
-            self.current_functions.remove(idx);
-        }
-
-        Ok(())
-    }
 }
 
-impl<W: Write> Write for State<W> {
+impl<'a, E: Encoder> Write for State<'a, E> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.writer.write_str(s)
+        if let Some(link) = &mut self.queued_link {
+            link.0.push_str(s);
+            Ok(())
+        } else {
+            self.encoder.chunk(s, &self.current_style);
+            Ok(())
+        }
     }
 }
 
-pub const PREFIX: &'static str = r###"
-#let project(title: "", authors: (), body) = {{
-  // Set the document's basic properties.
-  set document(author: authors, title: title)
-  set page(numbering: "1", number-align: center)
-  set text(font: "Linux Libertine", lang: "en")
 
-  // Title row.
-  align(center)[
-    #block(text(weight: 700, 1.75em, title))
-  ]
-
-  // Author information.
-  pad(
-    top: 0.5em,
-    bottom: 0.5em,
-    x: 2em,
-    grid(
-      columns: (1fr,) * calc.min(3, authors.len()),
-      gutter: 1em,
-      ..authors.map(author => align(center, strong(author))),
-    ),
-  )
-
-  // Main body.
-  set par(justify: true)
-
-  body
-}}
-"###;
-
-pub fn write_page(
+pub fn encode_page(
     tocitem: &TocItem,
     page_number: usize,
     lexed: &[Token],
-    output: impl Write,
+    encoder: &mut impl Encoder,
 ) -> eyre::Result<()> {
-    static ESCAPER: Lazy<Regex> = Lazy::new(|| Regex::new(r"[#()\[\]*=_`<>/$]").unwrap());
-
-    let mut state = State::new(output);
-
-    writeln!(
-        state,
-        "#align(center)[#heading(level: {}, numbering: \"1.a.\")[{}] <page{}>]",
-        tocitem.level,
-        ESCAPER.replace_all(&tocitem.title, "\\$0"),
-        page_number
-    )?;
+    let mut state = State::new(encoder);
 
     for t in lexed {
         match t {
@@ -176,8 +117,7 @@ pub fn write_page(
                     state.word_incomplete = false;
                 } else {
                     if s.len() > 0 {
-
-                        write!(state, "{}", ESCAPER.replace_all(s, "\\$0"))?;
+                        write!(state, "{}", s)?;
                     }
                 }
 
@@ -192,48 +132,48 @@ pub fn write_page(
             }
             Token::HardCarriageReturn => {
                 state.had_carriage_return = true;
-                writeln!(state, "\\")?;
+                writeln!(state, "\n")?;
             }
             Token::EndOfPage => {
                 break;
             }
             Token::ItalicsOn => {
-                state.push_state("emph", "emph")?;
+                state.current_style.emphasis = true;
             }
             Token::ItalicsOff => {
-                state.pop_state("emph")?;
+                state.current_style.emphasis = false;
             }
             Token::BoldOn => {
-                state.push_state("strong", "strong")?;
+                state.current_style.strong = true;
             }
             Token::BoldOff => {
-                state.pop_state("strong")?;
+                state.current_style.strong = false;
             }
             Token::FontPreset(n) => match n {
                 0 => {
-                    state.pop_state("color")?;
-                    state.pop_state("strong")?;
-                    state.pop_state("italic")?;
+                    state.current_style.color_gray = false;
+                    state.current_style.emphasis = false;
+                    state.current_style.strong = false;
                 }
                 1 => {
-                    state.push_state("size", format!("text(size: {}em)", 1.33))?;
+                    state.current_style.size = Some(NonZeroU8::new(133).unwrap());
                 }
                 2 => {
-                    state.push_state("size", format!("text(size: {}em)", 1.22))?;
+                    state.current_style.size = Some(NonZeroU8::new(122).unwrap());
                 }
                 3 => {
-                    state.push_state("size", format!("text(size: {}em)", 1.11))?;
+                    state.current_style.size = Some(NonZeroU8::new(111).unwrap());
                 }
                 4 => {
-                    state.push_state("size", format!("text(size: {}em)", 1.0))?;
-                    state.push_state("strong", "strong")?;
+                    state.current_style.size = None;
+                    state.current_style.strong = true;
                 }
                 5 => {
-                    state.push_state("size", format!("text(size: {}em)", 1.0))?;
+                    state.current_style.size = None;
                 }
                 6 => {
-                    state.push_state("size", format!("text(size: {}em)", 1.0))?;
-                    state.push_state("emph", "emph")?;
+                    state.current_style.size = None;
+                    state.current_style.emphasis = true;
                 }
                 _ => {}
             },
@@ -256,10 +196,10 @@ pub fn write_page(
                 state.node_number = Some(*n);
             }
             Token::SuperScriptOn => {
-                state.push_state("super", "super")?;
+                state.current_style.superscript = true;
             }
             Token::SuperScriptOff => {
-                state.pop_state("super")?;
+                state.current_style.superscript = false;
             }
             Token::Sigil(s) => {
                 state.sigil = Some(s.data.clone());
@@ -269,10 +209,10 @@ pub fn write_page(
                 state.add_invisible_hyphen = true;
             }
             Token::UnderlineOn => {
-                state.push_state("underline", "underline")?;
+                state.current_style.underline = true;
             }
             Token::UnderlineOff => {
-                state.pop_state("underline")?;
+                state.current_style.underline = false;
             }
             Token::GreekOn => {}
             Token::GreekOff => {}
@@ -287,25 +227,25 @@ pub fn write_page(
             Token::Null => {}
             Token::PageLink { page_number, name } => {
                 if *page_number != 0 {
-                    write!(state, " @page{} ", page_number)?;
+                    state.encoder.pageref(*page_number);
                 } else {
-                    panic!("I've yet to see an image link");
                     // TODO image link
                 }
             }
             Token::IDStart(_) => {}
             Token::IDEnd(_) => {}
             Token::SubscriptOn => {
-                state.push_state("sub", "sub")?;
+                state.current_style.subscript = true;
             }
             Token::SubscriptOff => {
-                state.pop_state("sub")?;
+                state.current_style.subscript = false;
             }
             Token::Color(colour) => {
                 if *colour == 1 {
-                    state.push_state("colour", "text(fill: gray)")?;
+                    state.current_style.color_gray = true;
                 } else {
-                    state.pop_state("colour")?;
+                    // yes, I know
+                    state.current_style.color_gray = false;
                 }
             }
             Token::InlineImage {
@@ -313,14 +253,13 @@ pub fn write_page(
                 height,
                 name,
             } => {}
-            Token::SearchWord(w) => {
-            }
+            Token::SearchWord(_) => {}
             Token::FontSize(size) => {
-                state.push_state("size", format!("text(size: {:02}em)", *size as f32 / 100.0))?;
+                state.current_style.size = Some(NonZeroU8::new(*size).unwrap());
             }
             Token::Copyright(_) => {}
             Token::AutoLink(page) => {
-                write!(state, "@page{}", page)?;
+                state.encoder.pageref(*page);
             }
             Token::SoftCarriageReturn => {
                 if !state.hyphen() {
@@ -331,38 +270,38 @@ pub fn write_page(
                 state.add_invisible_hyphen = true;
             }
             Token::LetterSpacingOn => {
-                state.push_state("tracking", "text(tracking: 1.5pt)")?;
+                state.current_style.wide_spacing = true;
             }
             Token::LetterSpacingOff => {
-                state.pop_state("tracking")?;
+                state.current_style.wide_spacing = false;
             }
             Token::HalfLineSpacing => {
                 write!(state, "\n")?;
             }
             Token::ListItemStart => {
                 panic!("actuall saw a list item");
-                write!(state, "[")?;
             }
             Token::ListItemEnd => {
-                write!(state, "]")?;
             }
-            Token::UnorderedListStart => {
-            }
-            Token::UnorderedListEnd => {
-            }
+            Token::UnorderedListStart => {}
+            Token::UnorderedListEnd => {}
             Token::SetX(indent) => {
-                state.push_state("padding", format!("pad(x: {}pt)", *indent as f32 / 100.0))?;
+                state.current_style.left_padding = NonZeroU16::new(*indent);
             }
             Token::SV(_) => {}
             Token::SVLemmaBegin(_) => {}
             Token::SVLemmaStop => {}
             Token::CenteredOn => {
+                state.current_style.alignment = Some("center");
             }
             Token::CenteredOff => {
+                state.current_style.alignment = None;
             }
             Token::AlignRightOn => {
+                state.current_style.alignment = Some("right");
             }
             Token::AlignRightOff => {
+                state.current_style.alignment = None;
             }
             Token::EOn => {}
             Token::EOff => {}
@@ -371,19 +310,21 @@ pub fn write_page(
             Token::Thumb => {}
             Token::EndNew(_) => {}
             Token::UrlBegin(url) => {
-                state.push_state("link", format!("link(\"{}\")", url.data))?;
+                state.queued_link = Some((String::new(), url.data.to_owned()));
             }
             Token::UrlEnd => {
-                state.pop_state("link")?;
+                if let Some((content, url)) = state.queued_link.take() {
+                    state.encoder.link(&url, &content);
+                }
             }
             Token::WordAnchor => {}
             Token::ThumbWWW => {}
             Token::S => {}
             Token::NoJustifyOn => {
-                state.push_state("nojustify", "par(justify: false)")?;
+                state.current_style.no_justification = true;
             }
             Token::NoJustifyOff => {
-                state.pop_state("nojustify")?;
+                state.current_style.no_justification = false;
             }
             Token::NextBlankFixed => {}
             Token::WordRest { space_at_end, data } => {
@@ -404,10 +345,10 @@ pub fn write_page(
             Token::HebrewOff => {}
             Token::NodeNumber2(_) => {}
             Token::StrikeThroughOn => {
-                state.push_state("strike", "strikethrough")?;
+                state.current_style.strikethrough = true;
             }
             Token::StrikeThroughOff => {
-                state.pop_state("strike")?;
+                state.current_style.strikethrough = false;
             }
             Token::SetY(_) => {}
             Token::Cor(_) => {}
@@ -417,33 +358,5 @@ pub fn write_page(
         }
     }
 
-    state.pop_all_states()?;
-
-    writeln!(state, "\n#pagebreak(weak: true)")?;
-
     Ok(())
-}
-
-pub fn count_delimeters(s: &str, hyphen: bool) -> usize {
-    let v = if !hyphen && !s.chars().all(|c| !c.is_alphanumeric()) {
-        1
-    } else {
-        0
-    };
-
-    let mut it = s.chars();
-
-    while let Some(c) = it.next() {
-        if c.is_alphanumeric() {
-            break;
-        }
-    }
-
-    while let Some(c) = it.next_back() {
-        if c.is_alphanumeric() {
-            break;
-        }
-    }
-
-    v + it.filter(|c| !c.is_alphanumeric()).count()
 }
